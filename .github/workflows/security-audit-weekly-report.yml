@@ -1,0 +1,109 @@
+name: Audit - Security weekly report
+
+# Posts a Slack summary of the past 7 days of security-audit runs to your
+# dedicated security channel. Runs Monday 02:00 UTC by default.
+#
+# Setup (one-time):
+#   1. Create a Slack Incoming Webhook for your security channel
+#      (Slack app config → Incoming Webhooks → Add New Webhook → pick channel).
+#   2. Add the URL as GitHub repo secret `SLACK_SECURITY_WEBHOOK_URL`.
+
+on:
+  schedule:
+    - cron: "0 2 * * 1"
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      SLACK_SECURITY_WEBHOOK_URL: ${{ secrets.SLACK_SECURITY_WEBHOOK_URL }}
+
+    steps:
+      - name: Verify webhook secret is set
+        run: |
+          if [ -z "$SLACK_SECURITY_WEBHOOK_URL" ]; then
+            echo "::error::SLACK_SECURITY_WEBHOOK_URL secret not set. See the file header for setup steps."
+            exit 1
+          fi
+
+      - name: Build weekly report
+        run: |
+          set -euo pipefail
+
+          since=$(date -u -d '7 days ago' +%Y-%m-%dT%H:%M:%SZ)
+          since_human=$(date -u -d '7 days ago' +%Y-%m-%d)
+          until_human=$(date -u +%Y-%m-%d)
+
+          runs=$(gh api -X GET \
+            "repos/${GITHUB_REPOSITORY}/actions/workflows/security-audit.yml/runs" \
+            -f "created=>=${since}" \
+            -f per_page=100 \
+            --jq '.workflow_runs // []')
+
+          total=$(jq 'length' <<<"$runs")
+          successes=$(jq '[.[] | select(.conclusion == "success")] | length' <<<"$runs")
+          failures=$(jq '[.[] | select(.conclusion == "failure")] | length' <<<"$runs")
+          other=$(( total - successes - failures ))
+
+          failed_lines=$(jq -r '
+            [.[] | select(.conclusion == "failure")
+              | "• <\(.html_url)|\(.created_at | split("T")[0])> (\(.event))"
+            ] | join("\n")
+          ' <<<"$runs")
+
+          latest=$(jq -r '
+            (sort_by(.created_at) | reverse | .[0]) as $r |
+            if $r == null then "(no runs)"
+            else "\($r.conclusion // "in-progress") at \($r.created_at)"
+            end
+          ' <<<"$runs")
+
+          if [ "$failures" -gt 0 ]; then
+            icon=":x:"
+            verdict="*${failures} failed run(s)* this week — investigate."
+          elif [ "$total" -eq 0 ]; then
+            icon=":warning:"
+            verdict="*No runs in the past 7 days.* Daily schedule may be paused or disabled."
+          else
+            icon=":white_check_mark:"
+            verdict="All clean this week."
+          fi
+
+          jq -n \
+            --arg icon "$icon" \
+            --arg verdict "$verdict" \
+            --arg since "$since_human" \
+            --arg until "$until_human" \
+            --arg total "$total" \
+            --arg successes "$successes" \
+            --arg failures "$failures" \
+            --arg other "$other" \
+            --arg latest "$latest" \
+            --arg failed_lines "$failed_lines" \
+            '{
+              text: (
+                "\($icon) *Security audit — weekly report* (\($since) → \($until))"
+                + "\n\($verdict)"
+                + "\n• Successes: \($successes)"
+                + "\n• Failures: \($failures)"
+                + "\n• Other (cancelled/in-progress): \($other)"
+                + "\n• Latest run: \($latest)"
+                + (if $failed_lines == "" then "" else "\n\n*Failed runs:*\n" + $failed_lines end)
+              )
+            }' > payload.json
+
+          cat payload.json
+
+      - name: Post to Slack
+        run: |
+          curl -sS --fail -X POST \
+            -H 'Content-type: application/json' \
+            --data "@payload.json" \
+            "$SLACK_SECURITY_WEBHOOK_URL"
