@@ -1,0 +1,64 @@
+# Dependabot: weekly grouped version updates + immediate security updates.
+# Each ecosystem below only takes effect if the corresponding manifest
+# actually exists in the repo — safe to leave them all enabled.
+version: 2
+updates:
+  # Python
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "03:00"
+      timezone: "UTC"
+    open-pull-requests-limit: 5
+    groups:
+      python-deps:
+        patterns: ["*"]
+    commit-message:
+      prefix: "deps(pip)"
+
+  # Node / JavaScript / TypeScript
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "03:00"
+      timezone: "UTC"
+    open-pull-requests-limit: 5
+    groups:
+      node-deps:
+        patterns: ["*"]
+    commit-message:
+      prefix: "deps(npm)"
+
+  # Go
+  - package-ecosystem: "gomod"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "03:00"
+      timezone: "UTC"
+    open-pull-requests-limit: 5
+    groups:
+      go-deps:
+        patterns: ["*"]
+    commit-message:
+      prefix: "deps(go)"
+
+  # GitHub Actions (always applicable)
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "03:00"
+      timezone: "UTC"
+    open-pull-requests-limit: 5
+    groups:
+      actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: "deps(actions)"
