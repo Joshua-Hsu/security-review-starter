@@ -1,0 +1,237 @@
+name: Audit - Security
+
+# Daily security audit. Runs on a schedule + on every PR to the default branch.
+# Language-specific steps auto-detect which manifests exist and only run then.
+#
+# Steps are ordered so language-agnostic checks (cheap) run first and
+# fail-fast, followed by language-specific scanners.
+#
+# Fails the workflow if any check turns up a finding, showing as a red X
+# in Actions / on the PR.
+
+on:
+  schedule:
+    - cron: "0 1 * * *"
+  workflow_dispatch:
+  pull_request:
+    branches: [main, master]
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v6
+        with:
+          fetch-depth: 0  # gitleaks needs full history
+
+      # ================================================================= #
+      # Language-agnostic checks — always run
+      # ================================================================= #
+
+      # ----------------------------------------------------------------- #
+      # 1. gitleaks — committed-secret scan across full git history.
+      #    Catches accidentally-committed credentials matching common
+      #    provider patterns (AWS, GCP, Notion, Slack, Stripe, etc.).
+      # ----------------------------------------------------------------- #
+      - name: Install gitleaks
+        run: |
+          GITLEAKS_VERSION=8.30.1
+          curl -sSL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" \
+            | tar -xz gitleaks
+          chmod +x gitleaks
+
+      - name: Gitleaks — scan history for committed secrets
+        run: ./gitleaks detect --source=. --redact --verbose --no-banner
+
+      # ----------------------------------------------------------------- #
+      # 2. OSV-Scanner — multi-ecosystem vulnerability scan. Covers Python,
+      #    Node/JS, Go, Rust, Java, and more via a single tool.
+      # ----------------------------------------------------------------- #
+      - name: Install OSV-Scanner
+        run: |
+          OSV_VERSION=2.4.0
+          curl -sSL "https://github.com/google/osv-scanner/releases/download/v${OSV_VERSION}/osv-scanner_linux_amd64" -o osv-scanner
+          chmod +x osv-scanner
+
+      - name: OSV-Scanner — recursive multi-ecosystem vuln scan
+        run: ./osv-scanner scan source --recursive .
+
+      # ----------------------------------------------------------------- #
+      # 3. Partial-value prints — `secret[:N]`, `token[:N]`, etc.
+      #    GitHub Actions only masks EXACT secret values. Substring slices
+      #    bypass the mask and leak the prefix into public-readable logs.
+      # ----------------------------------------------------------------- #
+      - name: Check for partial-value prints of credential-ish identifiers
+        run: |
+          set +e
+          # Scans common source-code dirs. Extend the path list to match your repo.
+          matches=$(grep -rnE "(print|console\.log|log\.[a-z]+|fmt\.Print)[^#]*\b[A-Za-z_]*(token|key|secret|webhook|password|credential)[A-Za-z_]*\s*\[\s*[0-9]*\s*:\s*[0-9]*\s*\]" \
+            src/ lib/ app/ scripts/ scraper/ .github/workflows/ 2>/dev/null)
+          if [ -n "$matches" ]; then
+            echo "::error::Found partial-value prints — these bypass GitHub Actions secret masking."
+            echo "$matches"
+            exit 1
+          fi
+          echo "OK — no partial-value prints detected."
+
+      # ----------------------------------------------------------------- #
+      # 4. Workflow trigger safety — `pull_request_target` exposes secrets
+      #    to fork PRs, which is the most common Actions exfil vector.
+      # ----------------------------------------------------------------- #
+      - name: Check no workflow uses pull_request_target
+        run: |
+          set +e
+          matches=$(grep -rnE "^\s*pull_request_target:" .github/workflows/ 2>/dev/null)
+          if [ -n "$matches" ]; then
+            echo "::error::pull_request_target lets fork PRs read repo secrets — remove it."
+            echo "$matches"
+            exit 1
+          fi
+          echo "OK — no pull_request_target triggers."
+
+      # ----------------------------------------------------------------- #
+      # 5. Secrets echoed inside workflow steps (the obvious mistake).
+      # ----------------------------------------------------------------- #
+      - name: Check no echo of secrets in workflows
+        run: |
+          set +e
+          matches=$(grep -rnP 'echo[^#\n]*\$\{\{\s*secrets\.[A-Z_]+\s*\}\}' .github/workflows/ 2>/dev/null)
+          if [ -n "$matches" ]; then
+            echo "::error::Workflow echoes a secret value — that prints it into the public log."
+            echo "$matches"
+            exit 1
+          fi
+          echo "OK — no secret echoing in workflows."
+
+      # ----------------------------------------------------------------- #
+      # 6. .env files must not be committed (only .env.example).
+      # ----------------------------------------------------------------- #
+      - name: Check no .env files are committed
+        run: |
+          set +e
+          leaked=$(git ls-files | grep -E '(^|/)\.env(\..+)?$' | grep -v '\.env\.example$' | grep -v '\.env\.sample$')
+          if [ -n "$leaked" ]; then
+            echo "::error::.env files should not be committed:"
+            echo "$leaked"
+            exit 1
+          fi
+          echo "OK — no .env files committed."
+
+      # ----------------------------------------------------------------- #
+      # 7. actionlint — workflow YAML validator. Catches typos in step
+      #    names, missing keys, runner mismatches, shell-quoting bugs.
+      # ----------------------------------------------------------------- #
+      - name: Install actionlint
+        run: |
+          ACTIONLINT_VERSION=1.7.12
+          bash <(curl -sS https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash) \
+            "$ACTIONLINT_VERSION"
+
+      - name: actionlint — validate workflow YAML
+        # -S warning filters out shellcheck's "info" and "style" findings
+        # (e.g. SC2129 brace-grouping suggestions).
+        run: ./actionlint -color -shellcheck "shellcheck -S warning"
+
+      # ================================================================= #
+      # Language-specific checks — auto-detected via manifest file
+      # ================================================================= #
+
+      # --- Python ------------------------------------------------------- #
+      - name: Detect Python
+        id: has_python
+        run: |
+          if [ -f requirements.txt ] || [ -f pyproject.toml ] || [ -f Pipfile ] || [ -f setup.py ]; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up Python 3.11
+        if: steps.has_python.outputs.found == 'true'
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6
+        with:
+          python-version: "3.11"
+
+      - name: Install pip-audit + Bandit
+        if: steps.has_python.outputs.found == 'true'
+        run: pip install pip-audit bandit==1.9.4
+
+      - name: pip-audit — check Python deps for known CVEs
+        if: steps.has_python.outputs.found == 'true' && hashFiles('requirements.txt') != ''
+        run: pip-audit -r requirements.txt --strict
+
+      - name: Bandit — Python security antipatterns
+        if: steps.has_python.outputs.found == 'true'
+        run: |
+          # Scan common Python source dirs. Extend to match your layout.
+          for dir in src lib app scripts scraper; do
+            if [ -d "$dir" ]; then
+              bandit -r "$dir" -lll -iii
+            fi
+          done
+
+      # --- Node / JavaScript / TypeScript ------------------------------- #
+      - name: Detect Node
+        id: has_node
+        run: |
+          if [ -f package.json ]; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up Node 20
+        if: steps.has_node.outputs.found == 'true'
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4
+        with:
+          node-version: "20"
+
+      # `npm audit` covers the standard case. For yarn projects, replace with
+      # `yarn npm audit --severity moderate`; for pnpm, `pnpm audit --audit-level moderate`.
+      - name: npm audit — check Node deps for known CVEs
+        if: steps.has_node.outputs.found == 'true'
+        run: npm audit --audit-level=moderate
+
+      # --- Go ----------------------------------------------------------- #
+      - name: Detect Go
+        id: has_go
+        run: |
+          if [ -f go.mod ]; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up Go
+        if: steps.has_go.outputs.found == 'true'
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff  # v5
+        with:
+          go-version: "stable"
+
+      - name: govulncheck — Go vulnerability scan
+        if: steps.has_go.outputs.found == 'true'
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          govulncheck ./...
+
+      # ================================================================= #
+      # Notification on failure — daily-run only.
+      # PR runs surface via the PR Checks UI; no need to double-ping.
+      # Requires SLACK_SECURITY_WEBHOOK_URL secret to be set.
+      # ================================================================= #
+      - name: Notify Slack on scheduled-run failure
+        if: failure() && github.event_name == 'schedule'
+        env:
+          SLACK_SECURITY_WEBHOOK_URL: ${{ secrets.SLACK_SECURITY_WEBHOOK_URL }}
+        run: |
+          if [ -n "$SLACK_SECURITY_WEBHOOK_URL" ]; then
+            run_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            curl -sS -X POST -H 'Content-type: application/json' \
+              --data "{\"text\":\":rotating_light: Daily security audit failed: ${run_url}\"}" \
+              "$SLACK_SECURITY_WEBHOOK_URL" >/dev/null
+          fi
