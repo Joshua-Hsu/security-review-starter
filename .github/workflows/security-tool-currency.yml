@@ -1,0 +1,182 @@
+name: Audit - Security tool currency
+
+# Monthly check that the security stack itself hasn't gone stale:
+#
+#  1. Pinned scanner versions in security-audit.yml (gitleaks, osv-scanner,
+#     actionlint, bandit) vs the latest upstream release.
+#  2. Every SHA-pinned GitHub Action (uses: owner/repo@<sha>  # vN) vs the
+#     commit its version-tag comment currently points to — detects upstream
+#     tag movement that Dependabot will also flag, plus any pin whose
+#     comment has drifted from reality.
+#
+# Drift is advisory, not a vulnerability — so this posts to Slack and fails
+# the run for visibility, but nothing here blocks other workflows.
+#
+# Uses `git ls-remote` against public repos (no API tokens, no rate-limit
+# headaches) and the public PyPI JSON API for bandit.
+
+on:
+  schedule:
+    - cron: "0 4 1 * *"   # 1st of each month, 04:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  currency:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      SLACK_SECURITY_WEBHOOK_URL: ${{ secrets.SLACK_SECURITY_WEBHOOK_URL }}
+
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v6
+
+      - name: Check pinned tool versions against latest releases
+        id: tools
+        run: |
+          set -euo pipefail
+          findings=""
+
+          latest_tag() {  # repo URL -> highest semver tag (no v prefix)
+            git ls-remote --tags "$1" 2>/dev/null \
+              | grep -v '\^{}' \
+              | grep -oE 'v?[0-9]+\.[0-9]+\.[0-9]+$' \
+              | sed 's/^v//' | sort -V | tail -1
+          }
+
+          check() {  # name, pinned, latest
+            local name="$1" pinned="$2" latest="$3"
+            if [ -z "$latest" ]; then
+              echo "  ? $name: could not determine latest (pinned $pinned)"
+              return
+            fi
+            if [ "$pinned" = "$latest" ]; then
+              echo "  = $name: $pinned (current)"
+            else
+              echo "  ! $name: pinned $pinned, latest $latest"
+              findings="${findings}\n• ${name}: pinned ${pinned} → latest ${latest}"
+            fi
+          }
+
+          AUDIT=.github/workflows/security-audit.yml
+
+          pinned_gitleaks=$(grep -oP 'GITLEAKS_VERSION=\K[0-9.]+' "$AUDIT" || echo "")
+          pinned_osv=$(grep -oP 'OSV_VERSION=\K[0-9.]+' "$AUDIT" || echo "")
+          pinned_actionlint=$(grep -oP 'ACTIONLINT_VERSION=\K[0-9.]+' "$AUDIT" || echo "")
+          pinned_bandit=$(grep -oP 'bandit==\K[0-9.]+' "$AUDIT" || echo "")
+
+          [ -n "$pinned_gitleaks" ]   && check gitleaks   "$pinned_gitleaks"   "$(latest_tag https://github.com/gitleaks/gitleaks)"
+          [ -n "$pinned_osv" ]        && check osv-scanner "$pinned_osv"       "$(latest_tag https://github.com/google/osv-scanner)"
+          [ -n "$pinned_actionlint" ] && check actionlint "$pinned_actionlint" "$(latest_tag https://github.com/rhysd/actionlint)"
+          if [ -n "$pinned_bandit" ]; then
+            latest_bandit=$(curl -sSf https://pypi.org/pypi/bandit/json | jq -r '.info.version' || echo "")
+            check bandit "$pinned_bandit" "$latest_bandit"
+          fi
+
+          {
+            echo "findings<<EOF"
+            echo -e "$findings"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Check SHA-pinned actions against their tag comments
+        id: shas
+        run: |
+          set -euo pipefail
+          findings=""
+
+          # Collect unique "owner/repo@sha  # tag" pins across all workflows.
+          pins=$(grep -rhoE 'uses: [A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+@[a-f0-9]{40}\s*#\s*v?[0-9.]+' .github/workflows/ \
+            | sed -E 's/uses: //; s/\s*#\s*/ /' | sort -u)
+
+          while read -r pin tag; do
+            [ -z "$pin" ] && continue
+            repo="${pin%@*}"
+            sha="${pin#*@}"
+            current=$(git ls-remote "https://github.com/${repo}" "refs/tags/${tag}" 2>/dev/null | cut -f1)
+            if [ -z "$current" ]; then
+              echo "  ? ${repo}@${tag}: tag not found upstream (pinned ${sha:0:7})"
+              findings="${findings}\n• ${repo}: tag ${tag} no longer exists upstream (pinned ${sha:0:7})"
+            elif [ "$current" = "$sha" ]; then
+              echo "  = ${repo}@${tag}: pin matches tag (${sha:0:7})"
+            else
+              echo "  ! ${repo}@${tag}: pinned ${sha:0:7}, tag now at ${current:0:7}"
+              findings="${findings}\n• ${repo}: ${tag} tag moved ${sha:0:7} → ${current:0:7} (Dependabot should have a PR; if not, investigate why the tag moved)"
+            fi
+          done <<< "$pins"
+
+          {
+            echo "findings<<EOF"
+            echo -e "$findings"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Check security-package version against the starter
+        id: pkg
+        run: |
+          set -euo pipefail
+          findings=""
+          STARTER_RAW="https://raw.githubusercontent.com/Joshua-Hsu/security-review-starter/main/.security-starter-version"
+
+          if [ ! -f .security-starter-version ]; then
+            echo "  ? no local .security-starter-version — package predates versioning; skipping"
+          else
+            local_v=$(tr -d '[:space:]' < .security-starter-version)
+            remote_v=$(curl -sSf "$STARTER_RAW" 2>/dev/null | tr -d '[:space:]' || echo "")
+            if [ -z "$remote_v" ]; then
+              echo "  ? could not fetch starter version (network or repo moved) — skipping"
+            elif [ "$local_v" = "$remote_v" ]; then
+              echo "  = security package: $local_v (current)"
+            elif [ "$(printf '%s\n%s\n' "$local_v" "$remote_v" | sort | tail -1)" = "$remote_v" ]; then
+              echo "  ! security package: local $local_v, starter $remote_v"
+              findings="• security-review-starter package: yours ${local_v} → starter ${remote_v}. Re-run install.sh (idempotent) or the bootstrap to pick up changes."
+            else
+              echo "  = security package: local $local_v is ahead of starter $remote_v (this repo may be the source of an unpublished update)"
+            fi
+          fi
+
+          {
+            echo "findings<<EOF"
+            echo -e "$findings"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Report
+        env:
+          TOOL_FINDINGS: ${{ steps.tools.outputs.findings }}
+          SHA_FINDINGS: ${{ steps.shas.outputs.findings }}
+          PKG_FINDINGS: ${{ steps.pkg.outputs.findings }}
+        run: |
+          set -euo pipefail
+          all="${TOOL_FINDINGS}${SHA_FINDINGS}${PKG_FINDINGS}"
+          # Strip whitespace/newlines to test emptiness
+          if [ -z "$(echo "$all" | tr -d '[:space:]')" ]; then
+            echo "All security tooling is current. Nothing to do."
+            exit 0
+          fi
+
+          echo "Drift detected:"
+          echo "${TOOL_FINDINGS}"
+          echo "${SHA_FINDINGS}"
+          echo "${PKG_FINDINGS}"
+
+          if [ -n "$SLACK_SECURITY_WEBHOOK_URL" ]; then
+            run_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            jq -n \
+              --arg tools "$TOOL_FINDINGS" \
+              --arg shas "$SHA_FINDINGS" \
+              --arg pkg "$PKG_FINDINGS" \
+              --arg url "$run_url" \
+              '{text: (":wrench: *Security tooling drift detected* (monthly currency check)"
+                + (if ($tools | gsub("\\s";"")) == "" then "" else "\n*Scanner versions:*" + $tools end)
+                + (if ($shas  | gsub("\\s";"")) == "" then "" else "\n*Action pins:*" + $shas end)
+                + (if ($pkg   | gsub("\\s";"")) == "" then "" else "\n*Package:*\n" + $pkg end)
+                + "\n<" + $url + "|Run details>")}' \
+              | curl -sS --fail -X POST -H 'Content-type: application/json' -d @- "$SLACK_SECURITY_WEBHOOK_URL" >/dev/null
+          fi
+
+          # Fail for visibility in the Actions tab. Drift is advisory but
+          # should not be silently green.
+          exit 1

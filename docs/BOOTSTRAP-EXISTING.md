@@ -83,6 +83,10 @@ For each file in the template, install with these rules:
 | `.github/dependabot.yml` | If exists, do NOT overwrite. Instead, leave both files' contents in the PR body so the user can manually merge entries. |
 | `.github/pull_request_template.md` | If exists, do NOT overwrite. Copy ours to `docs/pull_request_template.example.md` and note. |
 | `docs/BOOTSTRAP-EXISTING.md` | Copy only if absent — leaves a self-serve reference in the target repo for future re-installs. |
+| `docs/ecosystem-scan.md` | Copy only if absent. |
+| `.github/workflows/security-tool-currency.yml` | Same collision rule as the other workflows (install as `-NEW.yml` if a same-named file exists). |
+| `.github/workflows/security-ecosystem-reminder.yml` | Same collision rule. |
+| `.security-starter-version` | **Always overwrite** — this is the package version stamp. The monthly currency check compares it against the starter's copy and pings Slack when the package has updates. Overwriting on every install is what makes re-installs register as updates. |
 | `SETUP.md` | If exists, copy ours to `SETUP-SECURITY.md`. |
 
 Files the install NEVER touches:

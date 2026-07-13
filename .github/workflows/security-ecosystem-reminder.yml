@@ -1,0 +1,43 @@
+name: Audit - Security ecosystem scan reminder
+
+# Posts a monthly Slack reminder to run the qualitative security ecosystem
+# scan (docs/ecosystem-scan.md). Deliberately a reminder rather than an
+# automated scan: the scan uses a Claude session with web search, and the
+# user wants explicit approval before each run. Launching the session IS
+# the approval.
+#
+# Fires an hour after the tool-currency check on the 1st, so both land in
+# the security channel the same morning.
+
+on:
+  schedule:
+    - cron: "0 5 1 * *"   # 1st of each month, 05:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  remind:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      SLACK_SECURITY_WEBHOOK_URL: ${{ secrets.SLACK_SECURITY_WEBHOOK_URL }}
+
+    steps:
+      - name: Post reminder to Slack
+        run: |
+          set -euo pipefail
+          if [ -z "$SLACK_SECURITY_WEBHOOK_URL" ]; then
+            echo "::error::SLACK_SECURITY_WEBHOOK_URL secret not set."
+            exit 1
+          fi
+          repo_url="${{ github.server_url }}/${{ github.repository }}"
+          jq -n --arg repo "$repo_url" \
+            '{text: (":mag: *Monthly security ecosystem scan is due.*"
+              + "\nNothing runs automatically — start a Claude Code session in this repo and paste:"
+              + "\n```Run the monthly security ecosystem scan per docs/ecosystem-scan.md```"
+              + "\nThe session will web-search recent security developments, compare against our package, and propose changes (PRs only with your approval)."
+              + "\nProcedure: <" + $repo + "/blob/main/docs/ecosystem-scan.md|docs/ecosystem-scan.md>")}' \
+            | curl -sS --fail -X POST -H 'Content-type: application/json' -d @- "$SLACK_SECURITY_WEBHOOK_URL" >/dev/null
+          echo "Reminder posted."
