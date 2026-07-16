@@ -72,13 +72,17 @@ BEGIN_MARKER="<!-- security-review-starter:begin -->"
 #   copy_if_absent:   copy only when target doesn't exist
 #   copy_as_alt:      if target exists, copy the template file under a different name
 #   copy_or_append:   if target exists, append our snippet between markers (idempotent)
+#   copy_always:      overwrite unconditionally (version stamps only — never content)
 #
 # Format: "<template_path>|<rule>|<alt_target_path (optional)>"
 FILES=(
+  ".security-starter-version|copy_always"
   "CLAUDE.md|copy_or_append"
   "SETUP.md|copy_as_alt|SETUP-SECURITY.md"
   ".github/workflows/security-audit.yml|copy_as_alt|.github/workflows/security-audit-NEW.yml"
   ".github/workflows/security-audit-weekly-report.yml|copy_as_alt|.github/workflows/security-audit-weekly-report-NEW.yml"
+  ".github/workflows/security-tool-currency.yml|copy_as_alt|.github/workflows/security-tool-currency-NEW.yml"
+  ".github/workflows/security-ecosystem-reminder.yml|copy_as_alt|.github/workflows/security-ecosystem-reminder-NEW.yml"
   ".github/dependabot.yml|copy_if_absent"
   ".github/pull_request_template.md|copy_if_absent"
   "docs/standing-rules.md|copy_if_absent"
@@ -86,6 +90,7 @@ FILES=(
   "docs/review-methodology.md|copy_if_absent"
   "docs/roadmap-methodology.md|copy_if_absent"
   "docs/roadmap.md|copy_if_absent"
+  "docs/ecosystem-scan.md|copy_if_absent"
   "docs/BOOTSTRAP-EXISTING.md|copy_if_absent"
 )
 
@@ -148,6 +153,11 @@ for entry in "${FILES[@]}"; do
         added+=("$alt (installed as alt because $target exists)")
         echo "  + $alt (installed as alt because $target exists)"
       fi
+      ;;
+    copy_always)
+      cp "$src_full" "$target"
+      added+=("$target (refreshed — version stamp)")
+      echo "  ~ $target refreshed"
       ;;
     copy_or_append)
       # Idempotent: if our BEGIN_MARKER is already in the file, don't append again.
